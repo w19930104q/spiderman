@@ -52,6 +52,32 @@ Run the crawler:
 HackerNewsCrawler.crawl!
 ```
 
+### Runs, resume and the step ledger
+
+Calling `crawl!` starts a `Spiderman::Run`. The run snapshots the crawler's
+URLs, handlers and headers when it starts, so changing the class (or a parent
+class) while a crawl is in flight does not affect the run already under way.
+
+Every requested URL is recorded as a step with its parent URL, depth and
+status (`:pending`, `:success`, `:failed` or `:cancelled`), which makes it
+easy to locate the page that failed:
+
+```ruby
+run = HackerNewsCrawler.crawl!
+run.failed_steps.each do |step|
+  puts "#{step.url} (from #{step.parent_url}, depth #{step.depth}): #{step.error.message}"
+end
+```
+
+Within a run, each normalized URL is delivered successfully at most once —
+links that resolve to an already-handled URL are recorded as `:cancelled`
+duplicates, so cycles cannot loop forever. An exception in a handler marks
+the step as `:failed` and is re-raised; it is never reported as success.
+
+Calling `crawl!` again resumes the same run and only dispatches steps that
+have not succeeded yet — pages that were already crawled are not requested
+again.
+
 ### ActiveJob
 
 Spiderman works with [ActiveJob](https://edgeguides.rubyonrails.org/active_job_basics.html) out of the box. If your crawler class inherits from `ActiveJob:Base`, then requests will be made in your background worker. Each request will run as a separate job.

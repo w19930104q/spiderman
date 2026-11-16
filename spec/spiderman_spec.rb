@@ -46,8 +46,15 @@ RSpec.describe Spiderman do
       expect(request).to have_been_made.once
     end
 
-    it "yields a HTTP::Response to the processor" do
-      expect {|b| spider(&b).new.crawl! }.to yield_with_args(HTTP::Response)
+    it "yields a response that acts like a Nokogiri document" do
+      stub_request(:get, "https://example.com/document")
+        .to_return(body: '<html><body><a class="x">hi</a></body></html>')
+      yielded = nil
+      spider = Class.new { include Spiderman }
+      spider.crawl("https://example.com/document") { |response| yielded = response }
+      spider.new.crawl!
+      expect(yielded).to be_a(Net::HTTPResponse)
+      expect(yielded.css("a.x").text).to eq("hi")
     end
 
     it "requests with configured headers do" do

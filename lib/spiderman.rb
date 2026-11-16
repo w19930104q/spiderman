@@ -1,12 +1,11 @@
 require "logger"
-require "http"
-require "http/mime_type/html"
-require "http/acts_as_nokogiri_document"
 require "active_support/core_ext/class"
 require "active_support/core_ext/module"
 require "active_support/concern"
 require "spiderman/version"
+require "spiderman/acts_as_nokogiri_document"
 require "spiderman/runner"
+require "spiderman/run"
 require 'spiderman/railtie' if defined?(Rails)
 
 # Turn any class into a crawler by including this module.
@@ -44,8 +43,9 @@ module Spiderman
   included do
     Spiderman.add(self)
     class_attribute :crawler, instance_reader: true, default: Runner.new
+    class_attribute :current_run, instance_reader: true, default: nil
 
-    delegate :logger, to: :crawler
+    delegate :logger, to: :crawler unless method_defined?(:logger)
   end
 
   class_methods do
@@ -57,7 +57,7 @@ module Spiderman
     # starting URL. All `crawl` blocks will be called when calling
     # `SpiderName.crawl!`.
     #
-    # `response` is an enhanced `HTTP::Response` object that also acts like a
+    # `response` is a `Net::HTTPResponse` object that also acts like a
     # `Nokogiri::HTML` document, e.g. `response.css(…)`
     def crawl(*urls, &block)
       urls.each { |url| crawler.register(url, &block) }
@@ -71,33 +71,67 @@ module Spiderman
     end
 
     def inherited(subclass)
+      super
       subclass.crawler = crawler.dup
+      subclass.current_run = nil
       Spiderman.add(subclass)
     end
   end
 
+  # Begin a crawl, or resume one that was interrupted.
+  #
+  # The first call snapshots the crawler's urls, handlers and headers into
+  # a `Run`, so changes to the class afterwards do not affect the run in
+  # flight. Every requested URL is recorded with its parent URL, depth and
+  # status. Later calls resume the same run and only dispatch steps that
+  # have not succeeded yet — successful pages are never requested twice.
+  #
+  # Returns the `Run`, whose `steps` can be inspected to locate failures.
   def crawl!
-    crawler.urls.each do |url|
-      process! url
+    run = self.class.current_run || (self.class.current_run = Run.new(crawler))
+    run.schedule_seeds!
+
+    if active_job?
+      run.incomplete_steps.each { |step| self.class.perform_later(step.url.to_s, step.with) }
+    else
+      run.resume(self)
     end
+
+    run
   end
 
   def process!(url, with = nil)
-    if defined?(ActiveJob) && self.is_a?(ActiveJob::Base)
+    run = self.class.current_run
+    return if run && !run.schedule(url, with)
+
+    if active_job?
       self.class.perform_later(url.to_s, with)
+    elsif run
+      run.resume(self)
     else
       perform(url, with)
     end
   end
 
   def perform(url, with = nil)
-    handler = crawler.handler_for(with || url)
-    response = crawler.request(url)
-    instance_exec response, &handler
+    if (run = self.class.current_run)
+      step = run.step_for(url) || run.schedule(url, with)
+      run.perform_step(self, step) if step
+    else
+      handler = crawler.handler_for(with || url)
+      response = crawler.request(url)
+      instance_exec response, &handler
+    end
   end
 
   def name
     self.class.name.demodulize
+  end
+
+  private
+
+  def active_job?
+    defined?(ActiveJob::Base) && self.is_a?(ActiveJob::Base)
   end
 
   module_function

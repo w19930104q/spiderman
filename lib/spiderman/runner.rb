@@ -1,7 +1,10 @@
+require "net/http"
+require "uri"
+
 module Spiderman
   class Runner
     class_attribute :logger, instance_accessor: true, default: Logger.new(STDOUT, level: :info)
-    attr_reader :urls, :headers, :handlers
+    attr_reader :urls, :headers
 
     def initialize
       @urls = []
@@ -21,13 +24,18 @@ module Spiderman
       @handlers[name]
     end
 
-    def http
-      HTTP.use(logging: {logger: logger}).headers(headers).follow
-    end
+    # Request a URL with the configured headers, following redirects,
+    # and return a `Net::HTTPResponse` that acts like a Nokogiri
+    # document, e.g. `response.css(…)`.
+    def request(url, redirects_remaining = 5)
+      uri = URI.parse(url.to_s)
+      response = fetch(uri)
 
-    def request(url)
-      http.get(url).tap do |response|
-        response.extend HTTP::ActAsNokogiriDocument
+      if response.is_a?(Net::HTTPRedirection) && response["location"] && redirects_remaining > 0
+        request(URI.join(uri.to_s, response["location"]).to_s, redirects_remaining - 1)
+      else
+        response.extend ActsAsNokogiriDocument
+        response
       end
     end
 
@@ -41,7 +49,28 @@ module Spiderman
     end
 
   protected
+
     # Allow access for dup
     attr_reader :handlers
+
+  private
+
+    def fetch(uri)
+      logger.info("GET #{uri}") if logger
+      Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https") do |http|
+        http.request(build_request(uri))
+      end
+    end
+
+    def build_request(uri)
+      Net::HTTP::Get.new(uri).tap do |request|
+        headers.each { |name, value| request[header_name(name)] = value }
+      end
+    end
+
+    # :user_agent => "User-Agent"
+    def header_name(name)
+      name.to_s.split("_").map(&:capitalize).join("-")
+    end
   end
 end
